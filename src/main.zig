@@ -15,6 +15,14 @@ const event_type = enum {
     TIMER,
 };
 
+const request_data = struct {
+    buf: [4096]u8,
+    buf_slice: []u8,
+    from: std.net.Address,
+};
+
+var requests: [16]request_data = undefined;
+
 const doh3_headers = [_]quiche.quiche_h3_header{
     .{
         .name = ":method",
@@ -66,7 +74,7 @@ pub fn flush_egress(conn: ?*quiche.quiche_conn, upstream: std.posix.socket_t) vo
 
     const n_write = quiche.quiche_conn_send(conn, &out, out.len, &send_info);
     if (n_write > 0) {
-        std.debug.print("writing {} bytes to upstream\n", .{n_write});
+        // std.debug.print("writing {} bytes to upstream\n", .{n_write});
         _ = std.posix.send(upstream, out[0..@intCast(n_write)], 0) catch unreachable;
     }
 }
@@ -78,10 +86,10 @@ pub fn main() !void {
     try std.posix.bind(server_fd, &server_addr.any, server_addr.getOsSockLen());
     defer std.posix.close(server_fd);
 
-    var dns_request_stream_id: u64 = undefined;
-    var dns_request_buf: [4096]u8 = undefined;
-    var dns_request_buf_n_read: isize = undefined;
-    var dns_request_from: std.net.Address = undefined;
+    // var dns_request_stream_id: u64 = undefined;
+    // var dns_request_buf: [4096]u8 = undefined;
+    // var dns_request_buf_n_read: isize = undefined;
+    // var dns_request_from: std.net.Address = undefined;
 
     const upstream_fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.DGRAM, 0);
     _ = try std.posix.fcntl(server_fd, std.posix.F.SETFL, std.posix.SOCK.NONBLOCK);
@@ -89,8 +97,8 @@ pub fn main() !void {
     try std.posix.connect(upstream_fd, &upstream_addr.any, upstream_addr.getOsSockLen());
     defer std.posix.close(upstream_fd);
 
-    std.debug.print("server_fd: {}\n", .{server_fd});
-    std.debug.print("upstream fd: {}\n", .{upstream_fd});
+    // std.debug.print("server_fd: {}\n", .{server_fd});
+    // std.debug.print("upstream fd: {}\n", .{upstream_fd});
 
     const config = quiche.quiche_config_new(quiche.QUICHE_PROTOCOL_VERSION) orelse return;
 
@@ -115,9 +123,10 @@ pub fn main() !void {
 
     var cid: [LOCAL_CONN_ID_LEN]u8 = undefined;
     var urandom = try std.fs.openFileAbsolute("/dev/urandom", .{});
-    const r = try urandom.read(&cid);
-    std.debug.print("read {} bytes from /dev/urandom\n", .{r});
-    std.debug.print("cid: {any}\n", .{cid});
+    defer urandom.close();
+    _ = try urandom.read(&cid);
+    // std.debug.print("read {} bytes from /dev/urandom\n", .{r});
+    // std.debug.print("cid: {any}\n", .{cid});
 
     var upstream_local: std.net.Address = undefined;
     var upstream_local_len: std.posix.socklen_t = @sizeOf(std.net.Address);
@@ -144,8 +153,8 @@ pub fn main() !void {
         return error.anyerror;
     }
     // const epoll_fd: i32 = @truncate(epoll_fd_64);
-    std.debug.print("epoll_fd: {}\n", .{epoll_fd});
-    std.debug.print("{}\n", .{config});
+    // std.debug.print("epoll_fd: {}\n", .{epoll_fd});
+    // std.debug.print("{}\n", .{config});
 
     var server_event: std.os.linux.epoll_event = .{
         .events = std.os.linux.EPOLL.IN,
@@ -174,7 +183,7 @@ pub fn main() !void {
     }
 
     const timer_fd = try std.posix.timerfd_create(std.os.linux.CLOCK.MONOTONIC, std.os.linux.TFD{ ._0 = 0 });
-    std.debug.print("timer_fd: {}\n", .{timer_fd});
+    // std.debug.print("timer_fd: {}\n", .{timer_fd});
 
     var tspec: std.os.linux.itimerspec = .{
         .it_value = .{ .tv_sec = 0, .tv_nsec = 0 },
@@ -212,25 +221,30 @@ pub fn main() !void {
             const t: event_type = @enumFromInt(event.data.u32);
             switch (t) {
                 event_type.SERVER => {
-                    std.debug.print("server event\n", .{});
+                    // std.debug.print("server event\n", .{});
                     var out: [4096]u8 = undefined;
                     var from: std.net.Address = undefined;
                     var from_len: std.posix.socklen_t = @sizeOf(std.net.Address);
                     const n_read = try std.posix.recvfrom(server_fd, &out, 0, @ptrCast(&from), &from_len);
-                    std.debug.print("{} : {any}\n", .{ from, out[0..n_read] });
+                    // std.debug.print("{} : {any}\n", .{ from, out[0..n_read] });
 
-                    dns_request_from = from;
+                    // dns_request_from = from;
+
+                    // quiche.quiche_conn_is
 
                     const stream_id = quiche.quiche_h3_send_request(h3_conn, conn, &doh3_headers, doh3_headers.len, false);
-                    dns_request_stream_id = @bitCast(stream_id);
+                    std.debug.print("stream id: {}\n", .{stream_id});
+                    // dns_request_stream_id = @bitCast(stream_id);
+                    var request = &requests[(@as(u64, @intCast(stream_id)) >> 2) % requests.len];
+                    request.from = from;
 
                     _ = quiche.quiche_h3_send_body(h3_conn, conn, @bitCast(stream_id), &out, n_read, true);
                 },
                 event_type.UPSTREAM => {
-                    std.debug.print("upstream event\n", .{});
+                    // std.debug.print("upstream event\n", .{});
                     var in: [4096]u8 = undefined;
                     const n_read = try std.posix.recv(upstream_fd, &in, 0);
-                    std.debug.print("{} bytes from upstream\n", .{n_read});
+                    // std.debug.print("{} bytes from upstream\n", .{n_read});
 
                     var recv_info: quiche.quiche_recv_info = .{
                         .from = @ptrCast(&upstream_addr),
@@ -250,29 +264,33 @@ pub fn main() !void {
                             if (s < 0) {
                                 break;
                             }
-                            std.debug.print("h3 event on stream {}\n", .{s});
+                            // std.debug.print("h3 event on stream {}\n", .{s});
+
+                            // var request = &requests[(s >> 2) % requests.len];
+                            var request = &requests[(@as(u64, @intCast(s)) >> 2) % requests.len];
 
                             switch (quiche.quiche_h3_event_type(h3_event)) {
                                 quiche.QUICHE_H3_EVENT_HEADERS => {},
                                 quiche.QUICHE_H3_EVENT_DATA => {
-                                    if (s == dns_request_stream_id) {
-                                        dns_request_buf_n_read = quiche.quiche_h3_recv_body(
+                                    if (@mod(s, 4) == 0) {
+                                        const n_read_h3 = quiche.quiche_h3_recv_body(
                                             h3_conn,
                                             conn,
                                             @bitCast(s),
-                                            &dns_request_buf,
-                                            dns_request_buf.len,
+                                            &request.buf,
+                                            request.buf.len,
                                         );
+                                        request.buf_slice = request.buf[0..@bitCast(n_read_h3)];
                                     }
                                 },
                                 quiche.QUICHE_H3_EVENT_FINISHED => {
-                                    if (s == dns_request_stream_id) {
+                                    if (@mod(s, 4) == 0) {
                                         _ = try std.posix.sendto(
                                             server_fd,
-                                            dns_request_buf[0..@bitCast(dns_request_buf_n_read)],
+                                            request.buf_slice,
                                             0,
-                                            @ptrCast(&dns_request_from),
-                                            dns_request_from.getOsSockLen(),
+                                            @ptrCast(&request.from),
+                                            request.from.getOsSockLen(),
                                         );
                                     }
                                 },
@@ -285,7 +303,7 @@ pub fn main() !void {
                     }
                 },
                 event_type.TIMER => {
-                    std.debug.print("timer event\n", .{});
+                    // std.debug.print("timer event\n", .{});
                     quiche.quiche_conn_on_timeout(conn);
                 },
             }
@@ -304,7 +322,7 @@ pub fn main() !void {
                 .it_interval = .{ .tv_sec = 0, .tv_nsec = 0 },
             };
             try std.posix.timerfd_settime(timer_fd, @bitCast(@as(u32, 0)), &tspec, null);
-            std.debug.print("sleeping for {}ns\n", .{ns});
+            // std.debug.print("sleeping for {}ns\n", .{ns});
         }
     }
 }
