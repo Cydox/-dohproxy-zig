@@ -4,6 +4,8 @@
 const std = @import("std");
 const posix = std.posix;
 const linux = std.os.linux;
+const net = std.net;
+const fs = std.fs;
 
 const c = @cImport({
     @cInclude("quiche.h");
@@ -23,7 +25,7 @@ const request_data = struct {
     buf_upstream_slice: []u8,
     buf_dns: [4096]u8,
     buf_dns_slice: []u8,
-    from: std.net.Address,
+    from: net.Address,
     stream_id: u64,
 };
 
@@ -31,11 +33,11 @@ var requests: [16]request_data = undefined;
 
 const quic_upstream = struct {
     sock: posix.socket_t,
-    remote: std.net.Address,
-    local: std.net.Address,
+    remote: net.Address,
+    local: net.Address,
     conf: ?*c.quiche_config,
     conn: ?*c.quiche_conn,
-    urandom: std.fs.File,
+    urandom: fs.File,
 };
 
 fn quic_upstream_init(u: *quic_upstream) !void {
@@ -43,13 +45,13 @@ fn quic_upstream_init(u: *quic_upstream) !void {
     errdefer posix.close(u.sock);
     _ = try posix.fcntl(u.sock, posix.F.SETFL, posix.SOCK.NONBLOCK);
 
-    u.remote = try std.net.Address.parseIp("8.8.8.8", 443);
+    u.remote = try net.Address.parseIp("8.8.8.8", 443);
     try posix.connect(u.sock, &u.remote.any, u.remote.getOsSockLen());
 
-    var upstream_local_len: posix.socklen_t = @sizeOf(std.net.Address);
+    var upstream_local_len: posix.socklen_t = @sizeOf(net.Address);
     try posix.getsockname(u.sock, @ptrCast(&u.local), &upstream_local_len);
 
-    u.urandom = try std.fs.openFileAbsolute("/dev/urandom", .{});
+    u.urandom = try fs.openFileAbsolute("/dev/urandom", .{});
     errdefer u.urandom.close();
 
     const config = c.quiche_config_new(c.QUICHE_PROTOCOL_VERSION) orelse return error.nullptr;
@@ -166,7 +168,7 @@ pub fn flush_egress(u: *quic_upstream) void {
 pub fn main() !void {
     const server_fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
     _ = try posix.fcntl(server_fd, posix.F.SETFL, posix.SOCK.NONBLOCK);
-    const server_addr = try std.net.Address.parseIp("127.0.0.1", 5503);
+    const server_addr = try net.Address.parseIp("127.0.0.1", 5503);
     try posix.bind(server_fd, &server_addr.any, server_addr.getOsSockLen());
     defer posix.close(server_fd);
 
@@ -279,8 +281,8 @@ pub fn main() !void {
                     request.stream_id = request_id_received * 4;
                     request_id_received = request_id_received + 1;
                     // var out: [4096]u8 = undefined;
-                    var from: std.net.Address = undefined;
-                    var from_len: posix.socklen_t = @sizeOf(std.net.Address);
+                    var from: net.Address = undefined;
+                    var from_len: posix.socklen_t = @sizeOf(net.Address);
                     const n_read = try posix.recvfrom(server_fd, &request.buf_dns, 0, @ptrCast(&from), &from_len);
                     request.buf_dns_slice = request.buf_dns[0..n_read];
                     request.from = from;
