@@ -11,6 +11,9 @@ const c = @cImport({
     @cInclude("quiche.h");
 });
 
+const alloc = std.heap.c_allocator;
+const mpool = std.heap.MemoryPool();
+
 const MAX_DATAGRAM_SIZE = 1350;
 const LOCAL_CONN_ID_LEN = 16;
 
@@ -20,14 +23,27 @@ const event_type = enum {
     TIMER,
 };
 
-const request_data = struct {
-    buf: [2048]u8,
-    buf_slice: []u8,
+const request_t = struct {
     from: net.Address,
-    stream_id: u64,
+    data: []u8,
+    data_n: u32,
 };
 
-var requests: [32]request_data = undefined;
+// var requests: [32]request_data = undefined;
+var rmap: request_map_t = undefined;
+const request_map_t = std.HashMap(
+    u64,
+    request_t,
+    struct {
+        pub fn hash(_: @This(), a: u64) u64 {
+            return a >> 2;
+        }
+        pub fn eql(_: @This(), a: u64, b: u64) bool {
+            return a == b;
+        }
+    },
+    90,
+);
 
 const quic_upstream = struct {
     sock: posix.socket_t,
@@ -36,8 +52,7 @@ const quic_upstream = struct {
     conf: ?*c.quiche_config,
     conn: ?*c.quiche_conn,
     urandom: fs.File,
-    sess: [*c]u8,
-    sess_len: usize,
+    sess: ?[]u8,
 };
 
 fn quic_upstream_init(u: *quic_upstream) !void {
@@ -95,7 +110,10 @@ fn quic_upstream_connect(u: *quic_upstream) !void {
         u.conf,
     ) orelse return error.quiche_connect_error;
     if (u.sess) |sess| {
-        _ = c.quiche_conn_set_session(u.conn, sess, u.sess_len);
+        std.debug.print("trying to resume session ticket", .{});
+        const e = c.quiche_conn_set_session(u.conn, sess.ptr, sess.len);
+        alloc.free(sess);
+        std.debug.print("return value: {}\n", .{e});
     }
     _ = c.quiche_conn_set_keylog_path(u.conn, "/tmp/keys");
     flush_egress(u);
@@ -173,6 +191,8 @@ pub fn flush_egress(u: *quic_upstream) void {
 }
 
 pub fn main() !void {
+    rmap = request_map_t.init(alloc);
+
     const server_fd = try posix.socket(posix.AF.INET, posix.SOCK.DGRAM, 0);
     _ = try posix.fcntl(server_fd, posix.F.SETFL, posix.SOCK.NONBLOCK);
     const server_addr = try net.Address.parseIp("127.0.0.1", 5503);
@@ -272,8 +292,21 @@ pub fn main() !void {
                         if (c.quiche_conn_is_closed(q_upstream.conn) or restart) {
                             restart = false;
 
-                            c.quiche_conn_session(q_upstream.conn, &q_upstream.sess, &q_upstream.sess_len);
-                            std.debug.print("{}\n", .{q_upstream.sess_len});
+                            var it = rmap.valueIterator();
+                            while (it.next()) |req| {
+                                alloc.free(req.data);
+                            }
+                            rmap.deinit();
+                            rmap = request_map_t.init(alloc);
+
+                            var sess: [*c]u8 = undefined;
+                            var sess_len: usize = undefined;
+                            c.quiche_conn_session(q_upstream.conn, &sess, &sess_len);
+                            q_upstream.sess = try alloc.alloc(u8, sess_len);
+                            if (q_upstream.sess) |s| {
+                                @memcpy(s, sess[0..sess_len]);
+                            }
+                            std.debug.print("{}\n", .{sess_len});
 
                             std.debug.print("connection is closed!\n", .{});
                             c.quiche_conn_free(q_upstream.conn);
@@ -288,14 +321,18 @@ pub fn main() !void {
                         }
                     }
 
-                    var request: *request_data = &requests[request_id_received % requests.len];
-                    request.stream_id = request_id_received * 4;
-                    request_id_received = request_id_received + 1;
+                    var req: request_t = undefined;
+                    req.data = try alloc.alloc(u8, 1024);
+
                     var from: net.Address = undefined;
                     var from_len: posix.socklen_t = @sizeOf(net.Address);
-                    const n_read = try posix.recvfrom(server_fd, &request.buf, 0, @ptrCast(&from), &from_len);
-                    request.buf_slice = request.buf[0..n_read];
-                    request.from = from;
+                    req.data_n = @intCast(try posix.recvfrom(server_fd, req.data, 0, @ptrCast(&from), &from_len));
+                    req.from = from;
+
+                    const stream_id: u64 = request_id_received * 4;
+                    request_id_received = request_id_received + 1;
+
+                    try rmap.put(stream_id, req);
 
                     if (q_upstream.conn == null) {
                         try quic_upstream_connect(&q_upstream);
@@ -328,32 +365,39 @@ pub fn main() !void {
                             }
                             defer c.quiche_h3_event_free(h3_event);
 
-                            var request = &requests[(@as(usize, @intCast(s)) >> 2) % requests.len];
-
                             switch (c.quiche_h3_event_type(h3_event)) {
                                 c.QUICHE_H3_EVENT_HEADERS => {},
                                 c.QUICHE_H3_EVENT_DATA => {
                                     if (@rem(s, 4) == 0) {
+                                        const stream_id: u64 = @bitCast(s);
+                                        const req = rmap.getPtr(stream_id) orelse break;
+
+                                        req.data = try alloc.realloc(req.data, 2048);
                                         // TODO: call recv_body in loop and handle multiple data events on same stream
-                                        const n_read_h3 = c.quiche_h3_recv_body(
+                                        req.data_n = @intCast(c.quiche_h3_recv_body(
                                             h3_conn,
                                             q_upstream.conn,
                                             @bitCast(s),
-                                            &request.buf,
-                                            request.buf.len,
-                                        );
-                                        request.buf_slice = request.buf[0..@bitCast(n_read_h3)];
+                                            req.data.ptr,
+                                            req.data.len,
+                                        ));
                                     }
                                 },
                                 c.QUICHE_H3_EVENT_FINISHED => {
                                     if (@rem(s, 4) == 0) {
+                                        const stream_id: u64 = @bitCast(s);
+                                        const req = rmap.getPtr(stream_id) orelse break;
+
                                         _ = try posix.sendto(
                                             server_fd,
-                                            request.buf_slice,
+                                            req.data[0..req.data_n],
                                             0,
-                                            @ptrCast(&request.from),
-                                            request.from.getOsSockLen(),
+                                            @ptrCast(&req.from),
+                                            req.from.getOsSockLen(),
                                         );
+
+                                        alloc.free(req.data);
+                                        _ = rmap.remove(stream_id);
                                     }
                                 },
                                 c.QUICHE_H3_EVENT_GOAWAY => {
@@ -378,9 +422,13 @@ pub fn main() !void {
             if (h3_conn != null) {
                 for (request_id_sent..request_id_received) |i| {
                     std.debug.print("request id: {}\n", .{i});
-                    const request: *request_data = &requests[i % requests.len];
-                    const stream_id = c.quiche_h3_send_request(h3_conn, q_upstream.conn, &doh3_headers, doh3_headers.len, false);
-                    _ = c.quiche_h3_send_body(h3_conn, q_upstream.conn, @bitCast(stream_id), request.buf_slice.ptr, request.buf_slice.len, true);
+
+                    const stream_id: u64 = i << 2;
+                    const req = rmap.getPtr(stream_id) orelse break;
+
+                    _ = c.quiche_h3_send_request(h3_conn, q_upstream.conn, &doh3_headers, doh3_headers.len, false);
+                    _ = c.quiche_h3_send_body(h3_conn, q_upstream.conn, @bitCast(stream_id), req.data.ptr, req.data_n, true);
+                    req.data_n = 0;
                 }
                 request_id_sent = request_id_received;
             }
